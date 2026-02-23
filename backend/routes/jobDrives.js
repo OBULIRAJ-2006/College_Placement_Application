@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const JobDrive = require("../models/JobDrive");
 const User = require("../models/User");
+const PlacedStudent = require("../models/PlacedStudent");
 const { auth } = require("../middleware/auth");
 const { requirePlacementConsent } = require("../middleware/placementConsent");
 const { requireCompleteProfile } = require("../middleware/profileComplete");
@@ -11,6 +12,44 @@ const { emitJobDriveUpdate } = require("../utils/socketUtils");
 const normalizeDepartment = (dept) => {
   if (!dept) return null;
   return dept.toLowerCase().trim();
+};
+
+const upsertPlacedStudents = async (jobDrive, placedStudents, addedBy) => {
+  const safeStudents = (placedStudents || []).filter(
+    (student) => student && student.rollNumber
+  );
+
+  if (safeStudents.length === 0) {
+    return;
+  }
+
+  const operations = safeStudents.map((student) => {
+    const email = student.email ? student.email.toLowerCase() : undefined;
+    return {
+      updateOne: {
+        filter: {
+          jobDrive: jobDrive._id,
+          rollNumber: student.rollNumber,
+        },
+        update: {
+          $set: {
+            jobDrive: jobDrive._id,
+            companyName: jobDrive.companyName,
+            name: student.name || "N/A",
+            rollNumber: student.rollNumber,
+            department: student.department || "",
+            email: email || "",
+            mobileNumber: student.mobileNumber || "",
+            addedBy: student.addedBy || addedBy,
+            addedAt: student.addedAt || new Date(),
+          },
+        },
+        upsert: true,
+      },
+    };
+  });
+
+  await PlacedStudent.bulkWrite(operations, { ordered: false });
 };
 
 // Authorization middleware for PO and PR
@@ -1333,6 +1372,8 @@ router.post(
           console.log("✅ Updated", updateResult.modifiedCount, "student profiles");
         }
 
+        await upsertPlacedStudents(jobDrive, jobDrive.placedStudents, req.user.id);
+
         return res.json({
           message: "Placement already finalized. Synced placed student profiles.",
           totalPlacedStudents: jobDrive.placedStudents?.length || 0,
@@ -1379,6 +1420,8 @@ router.post(
       jobDrive.placedStudents = placedStudents;
       jobDrive.placementFinalized = true;
       await jobDrive.save();
+
+      await upsertPlacedStudents(jobDrive, placedStudents, req.user.id);
 
       // Update student placement status in user profiles
       console.log("Updating student profiles for IDs:", selectedStudentIds);
@@ -1450,11 +1493,38 @@ router.put(
         return res.status(400).json({ message: "Invalid student index" });
       }
 
+      const previousStudent = jobDrive.placedStudents[index];
       jobDrive.placedStudents[index] = {
         ...jobDrive.placedStudents[index],
         ...studentData,
       };
       await jobDrive.save();
+
+      const updatedStudent = jobDrive.placedStudents[index];
+      const updateFilter = {
+        jobDrive: jobDrive._id,
+        rollNumber: previousStudent?.rollNumber || updatedStudent?.rollNumber,
+      };
+
+      await PlacedStudent.updateOne(
+        updateFilter,
+        {
+          $set: {
+            jobDrive: jobDrive._id,
+            companyName: jobDrive.companyName,
+            name: updatedStudent?.name || "N/A",
+            rollNumber: updatedStudent?.rollNumber || "",
+            department: updatedStudent?.department || "",
+            email: updatedStudent?.email
+              ? updatedStudent.email.toLowerCase()
+              : "",
+            mobileNumber: updatedStudent?.mobileNumber || "",
+            addedBy: updatedStudent?.addedBy || req.user.id,
+            addedAt: updatedStudent?.addedAt || new Date(),
+          },
+        },
+        { upsert: true }
+      );
 
       res.json({
         message: "Placed student updated successfully",
@@ -1484,6 +1554,16 @@ router.delete(
       const removedStudent = jobDrive.placedStudents[index];
       jobDrive.placedStudents.splice(index, 1);
       await jobDrive.save();
+
+      if (removedStudent?.rollNumber || removedStudent?.email) {
+        const deleteFilter = { jobDrive: jobDrive._id };
+        if (removedStudent?.rollNumber) {
+          deleteFilter.rollNumber = removedStudent.rollNumber;
+        } else if (removedStudent?.email) {
+          deleteFilter.email = removedStudent.email.toLowerCase();
+        }
+        await PlacedStudent.deleteOne(deleteFilter);
+      }
 
       if (removedStudent?.email) {
         await User.updateOne(
